@@ -1,0 +1,5 @@
+playwright>=1.45.0
+APScheduler>=3.10.4
+requests>=2.32.3
+python-telegram-bot>=21.4
+python-dotenv>=1.0.1
