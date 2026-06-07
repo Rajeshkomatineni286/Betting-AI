@@ -8,17 +8,18 @@ import logging
 import math
 import os
 import random
+import re
 import signal
 import sqlite3
 import statistics
 import time
 import traceback
-from collections import defaultdict, deque
+from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime, date, timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
-from typing import Any, Callable, Deque, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 
 import requests
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -1116,6 +1117,59 @@ class PaperTradingEngine:
 
 
 class MatchExtractor:
+    INTERNAL_NAME_PATTERNS = (
+        "installments",
+        "component",
+        "container",
+        "marketgroup",
+        "full_screen",
+        "data-testid",
+        "data-test",
+        "selection",
+        "coupon",
+        "carousel",
+        "modal",
+        "drawer",
+        "widget",
+    )
+    PLAYER_LINE_BLOCKLIST = {
+        "tennis",
+        "live",
+        "in-play",
+        "set",
+        "sets",
+        "game",
+        "games",
+        "score",
+        "odds",
+        "back",
+        "lay",
+        "cash out",
+        "suspended",
+        "postponed",
+        "retired",
+        "abandoned",
+        "closed",
+        "settled",
+        "match odds",
+        "winner",
+        "market",
+        "today",
+        "tomorrow",
+        "stream",
+        "statistics",
+        "stats",
+        "atp",
+        "wta",
+        "challenger",
+        "itf",
+        "qualifying",
+    }
+    NAME_TOKEN_RE = re.compile(r"^[A-ZÀ-ÖØ-Þ][A-Za-zÀ-ÖØ-öø-ÿ'’.-]*$")
+    SCORE_RE = re.compile(r"\b(?:[0-7]-[0-7]|0|15|30|40|AD)\b", re.IGNORECASE)
+    ODDS_RE = re.compile(r"\b\d{1,2}\.\d{1,2}\b")
+    VS_RE = re.compile(r"(?P<a>[A-ZÀ-ÖØ-Þ][A-Za-zÀ-ÖØ-öø-ÿ'’.\- ]{1,60}?)\s+(?:vs?|VS?)\s+(?P<b>[A-ZÀ-ÖØ-Þ][A-Za-zÀ-ÖØ-öø-ÿ'’.\- ]{1,60})")
+
     def __init__(self, selectors: SelectorSet, logger: logging.Logger):
         self.selectors = selectors
         self.logger = logger
@@ -1124,57 +1178,100 @@ class MatchExtractor:
         script = r"""
         (selectors) => {
             const clean = (value) => (value || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+            const cleanBlock = (value) => (value || '').replace(/\u00a0/g, ' ').replace(/\r/g, '\n').replace(/[ \t]+/g, ' ').replace(/\n+/g, '\n').trim();
             const oddsNumber = (value) => {
                 const match = clean(value).match(/\b\d{1,2}\.\d{1,2}\b/);
                 return match ? Number(match[0]) : 0;
             };
-            const nodes = Array.from(document.querySelectorAll(selectors.match));
-            const candidates = nodes.length ? nodes : Array.from(document.querySelectorAll('article, section, li, tr, div')).filter((node) => /tennis|set|game|\b15\b|\b30\b|\b40\b/i.test(node.innerText || ''));
-            return candidates.slice(0, 80).map((node, index) => {
-                const text = clean(node.innerText);
-                const attrs = ['data-event-id', 'data-match-id', 'id'].map((name) => node.getAttribute(name)).filter(Boolean);
-                const oddsNodes = Array.from(node.querySelectorAll(selectors.odds || 'button, span, div'));
-                const odds = oddsNodes.map((n) => oddsNumber(n.innerText)).filter((value) => value > 1.01 && value < 100);
+            const hasTennisSignal = (text) => /tennis|\bset\b|\bgame\b|\b15\b|\b30\b|\b40\b|\bAD\b|\b\d-[0-7]\b/i.test(text || '');
+            const scoreSelectors = '[data-testid*="score" i], [data-test*="score" i], [class*="score" i], [class*="game" i], [class*="point" i]';
+            const playerSelectors = '[data-testid*="player" i], [data-testid*="participant" i], [data-testid*="runner" i], [data-test*="player" i], [class*="player" i], [class*="participant" i], [class*="runner" i], [class*="competitor" i], [class*="team" i]';
+            const baseNodes = Array.from(document.querySelectorAll(selectors.match || '[data-event-id], article, section, li, tr'));
+            const fallbackNodes = Array.from(document.querySelectorAll('article, section, li, tr, [data-event-id], [data-testid*="event" i], [class*="event" i]'));
+            const seen = new Set();
+            const candidates = [];
+            [...baseNodes, ...fallbackNodes].forEach((node) => {
+                if (!node || seen.has(node)) return;
+                seen.add(node);
+                const text = cleanBlock(node.innerText);
+                if (!text || text.length < 12 || text.length > 2500) return;
+                const odds = Array.from(node.querySelectorAll(selectors.odds || 'button, span, div')).map((n) => oddsNumber(n.innerText)).filter((value) => value > 1.01 && value < 100);
+                const playerTexts = Array.from(node.querySelectorAll(playerSelectors)).map((n) => clean(n.innerText)).filter(Boolean).slice(0, 12);
+                const scoreTexts = Array.from(node.querySelectorAll(scoreSelectors)).map((n) => clean(n.innerText)).filter(Boolean).slice(0, 8);
+                if (odds.length < 2 && playerTexts.length < 2 && !hasTennisSignal(text)) return;
+                candidates.push({node, text, odds, playerTexts, scoreTexts});
+            });
+            return candidates.slice(0, 80).map((item, index) => {
+                const node = item.node;
                 const statusNode = selectors.market_status ? node.querySelector(selectors.market_status) : null;
                 const scoreNode = selectors.score ? node.querySelector(selectors.score) : null;
-                const liquidityMatch = text.match(/(?:£|\$|€)\s?([\d,]+(?:\.\d+)?)/);
+                const liquidityMatch = item.text.match(/(?:£|\$|€)\s?([\d,]+(?:\.\d+)?)/);
                 return {
                     index,
-                    id: attrs[0] || '',
-                    text,
+                    text: item.text,
                     status: clean(statusNode ? statusNode.innerText : ''),
-                    score: clean(scoreNode ? scoreNode.innerText : ''),
-                    odds,
-                    liquidity: liquidityMatch ? Number(liquidityMatch[1].replace(/,/g, '')) : odds.length * 1000
+                    score: clean(scoreNode ? scoreNode.innerText : item.scoreTexts.join(' ')),
+                    playerTexts: item.playerTexts,
+                    scoreTexts: item.scoreTexts,
+                    odds: item.odds,
+                    liquidity: liquidityMatch ? Number(liquidityMatch[1].replace(/,/g, '')) : item.odds.length * 1000
                 };
-            }).filter((item) => item.text.length > 10 || item.odds.length >= 2);
+            });
         }
         """
         raw_items = await page.evaluate(script, dataclasses.asdict(self.selectors))
         snapshots: List[MatchSnapshot] = []
+        extraction_failures = 0
+        seen_matches: set[str] = set()
         for item in raw_items:
             snapshot = self._normalize_item(item)
             if snapshot and self._is_live_tennis(snapshot):
+                display_name = self.display_name(snapshot)
+                if display_name in seen_matches:
+                    continue
+                seen_matches.add(display_name)
                 snapshots.append(snapshot)
+                self.logger.info(
+                    "MATCH CARD DEBUG\nRaw text extracted: %s\nParsed player names: %s vs %s\nParsed tournament: %s\nParsed score: %s",
+                    normalize_text(item.get("text", ""))[:1200],
+                    snapshot.player_a,
+                    snapshot.player_b,
+                    snapshot.tournament,
+                    self.score_display(snapshot),
+                    extra={"event": "match_card_debug", "match_id": snapshot.match_id},
+                )
+            else:
+                if self._looks_like_match_card(item):
+                    extraction_failures += 1
+                    self.logger.error(
+                        "MATCH EXTRACTION FAILURE\nRaw text extracted: %s\nParsed player names: unavailable\nParsed tournament: unavailable\nParsed score: %s",
+                        normalize_text(item.get("text", ""))[:1200],
+                        normalize_text(item.get("score", "")),
+                        extra={"event": "match_extraction_failure"},
+                    )
+        if extraction_failures:
+            await self._capture_extraction_failure(page)
         snapshots.sort(key=lambda item: item.liquidity, reverse=True)
         return snapshots[: max(MIN_CONCURRENT_MATCH_CAPACITY, len(snapshots))]
 
     def _normalize_item(self, item: Dict[str, Any]) -> Optional[MatchSnapshot]:
-        text = normalize_text(item.get("text", ""))
+        raw_text = str(item.get("text", "") or "")
+        text = normalize_text(raw_text)
         lowered = text.lower()
-        if not text:
+        if not text or self._is_internal_identifier(text):
             return None
         status = normalize_text(item.get("status") or ("Live" if "live" in lowered or "in-play" in lowered else "Live"))
-        players = self._extract_players(text)
+        players = self._extract_players(raw_text, item.get("playerTexts", []))
         if len(players) < 2:
             return None
-        score_text = normalize_text(item.get("score") or text)
-        set_score, game_score, point_score = parse_score_text(score_text)
+        score_text = normalize_text(item.get("score") or " ".join(item.get("scoreTexts", [])) or text)
+        score_text_without_odds = self.ODDS_RE.sub(" ", score_text)
+        set_score, game_score, point_score = parse_score_text(score_text_without_odds)
         odds = [float(value) for value in item.get("odds", []) if float(value) > 1.01]
         while len(odds) < 4:
             odds.append(0.0)
-        tournament = self._extract_tournament(text, players)
-        match_id = normalize_text(item.get("id")) or stable_id([tournament, players[0], players[1]])
+        tournament = self._extract_tournament(raw_text, players)
+        match_id = stable_id([tournament, players[0], players[1]])
         return MatchSnapshot(
             match_id=match_id,
             tournament=tournament,
@@ -1192,46 +1289,116 @@ class MatchExtractor:
             timestamp=iso_now(),
         )
 
-    def _extract_players(self, text: str) -> List[str]:
-        separators = [" v ", " vs ", " - ", "\n"]
+    def _extract_players(self, text: str, player_texts: Sequence[str]) -> List[str]:
+        candidate_lines = [normalize_text(value) for value in player_texts if normalize_text(value)]
         compact = text.replace("\r", "\n")
-        lines = [normalize_text(line) for line in compact.split("\n") if normalize_text(line)]
-        names: List[str] = []
-        for line in lines[:8]:
-            low = line.lower()
-            if any(word in low for word in ["tennis", "live", "set", "game", "odds", "back", "lay"]):
-                continue
-            if safe_float(line, -999) != -999:
-                continue
-            if 2 <= len(line) <= 60:
-                names.append(line)
-        if len(names) >= 2:
-            return names[:2]
-        for separator in separators:
-            if separator in f" {text.lower()} ":
-                parts = [normalize_text(part) for part in text.split(separator.strip())]
-                if len(parts) >= 2:
-                    return [parts[0][:60], parts[1][:60]]
-        capitalized = []
-        for token in text.split():
-            if token[:1].isupper() and not any(ch.isdigit() for ch in token):
-                capitalized.append(token.strip(" ,.;"))
-        if len(capitalized) >= 4:
-            return [" ".join(capitalized[:2]), " ".join(capitalized[2:4])]
+        candidate_lines.extend(normalize_text(line) for line in compact.split("\n") if normalize_text(line))
+        cleaned_lines = [self._clean_player_candidate(line) for line in candidate_lines]
+        valid_lines = []
+        for line in cleaned_lines:
+            if self._is_valid_player_name(line):
+                valid_lines.append(line)
+        for i in range(len(valid_lines) - 1):
+            if valid_lines[i].lower() != valid_lines[i + 1].lower():
+                return [valid_lines[i], valid_lines[i + 1]]
+        vs_match = self.VS_RE.search(text)
+        if vs_match:
+            player_a = self._clean_player_candidate(vs_match.group("a"))
+            player_b = self._clean_player_candidate(vs_match.group("b"))
+            if self._is_valid_player_name(player_a) and self._is_valid_player_name(player_b):
+                return [player_a, player_b]
         return []
 
+    def _clean_player_candidate(self, value: str) -> str:
+        text = normalize_text(value)
+        text = self.ODDS_RE.sub(" ", text)
+        text = re.sub(r"\b(?:0|15|30|40|AD)\b", " ", text, flags=re.IGNORECASE)
+        text = re.sub(r"\b[0-7]-[0-7]\b", " ", text)
+        text = re.sub(r"\([^)]*\)", " ", text)
+        text = re.sub(r"\b(?:Back|Lay|Live|Set|Game|Score|Odds|Market|Winner)\b", " ", text, flags=re.IGNORECASE)
+        text = normalize_text(text.strip("|•·,:;[]{}"))
+        return text[:80]
+
+    def _is_valid_player_name(self, value: str) -> bool:
+        text = normalize_text(value)
+        lowered = text.lower()
+        if not text or self._is_internal_identifier(text):
+            return False
+        if len(text) < 3 or len(text) > 60:
+            return False
+        if any(blocked in lowered for blocked in self.PLAYER_LINE_BLOCKLIST):
+            return False
+        if self.ODDS_RE.search(text) or self.SCORE_RE.search(text):
+            return False
+        tokens = [token for token in re.split(r"\s+", text) if token]
+        if not 1 <= len(tokens) <= 5:
+            return False
+        letter_count = sum(ch.isalpha() for ch in text)
+        if letter_count < 3:
+            return False
+        return all(self.NAME_TOKEN_RE.match(token.strip(",")) for token in tokens)
+
+    def _is_internal_identifier(self, value: str) -> bool:
+        text = normalize_text(value)
+        lowered = text.lower()
+        if any(pattern in lowered for pattern in self.INTERNAL_NAME_PATTERNS):
+            return True
+        if re.fullmatch(r"[a-z0-9_\-]{8,}", text) and ("_" in text or "-" in text):
+            return True
+        if re.fullmatch(r"[a-f0-9]{12,}", lowered):
+            return True
+        return False
+
     def _extract_tournament(self, text: str, players: List[str]) -> str:
-        first_line = normalize_text(text.split("\n")[0])
-        if first_line and all(player not in first_line for player in players):
-            return first_line[:120]
-        return "Live Tennis"
+        lines = [normalize_text(line) for line in text.replace("\r", "\n").split("\n") if normalize_text(line)]
+        for line in lines[:8]:
+            cleaned = self._clean_player_candidate(line)
+            lowered = cleaned.lower()
+            if not cleaned or any(player.lower() == cleaned.lower() for player in players):
+                continue
+            if self._is_internal_identifier(cleaned):
+                continue
+            if self.ODDS_RE.search(cleaned) or self.SCORE_RE.search(cleaned):
+                continue
+            if any(word in lowered for word in ["atp", "wta", "challenger", "itf", "tennis", "open", "cup", "masters", "qualifying"]):
+                return cleaned[:120]
+        return "ATP/WTA"
 
     def _is_live_tennis(self, snapshot: MatchSnapshot) -> bool:
         status = snapshot.status.lower()
         if any(blocked in status for blocked in IGNORED_STATUSES):
             return False
         combined = f"{snapshot.tournament} {snapshot.status} {snapshot.set_score} {snapshot.game_score} {snapshot.point_score}".lower()
-        return "tennis" in combined or "live" in combined or bool(snapshot.set_score or snapshot.game_score or snapshot.point_score)
+        return "tennis" in combined or "live" in combined or "atp" in combined or "wta" in combined or bool(snapshot.set_score or snapshot.game_score or snapshot.point_score)
+
+    def _looks_like_match_card(self, item: Dict[str, Any]) -> bool:
+        raw_text = str(item.get("text", "") or "")
+        text = normalize_text(raw_text)
+        if not text or self._is_internal_identifier(text):
+            return False
+        odds_count = len([value for value in item.get("odds", []) if float(value) > 1.01])
+        score_text = normalize_text(item.get("score") or " ".join(item.get("scoreTexts", [])) or text)
+        return odds_count >= 2 and bool(self.SCORE_RE.search(score_text) or "tennis" in text.lower() or "live" in text.lower())
+
+    async def _capture_extraction_failure(self, page: Page) -> None:
+        SCREENSHOT_DIR.mkdir(exist_ok=True)
+        SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        screenshot_path = SCREENSHOT_DIR / f"match_extraction_failure_{stamp}.png"
+        html_path = SNAPSHOT_DIR / f"match_extraction_failure_{stamp}.html"
+        with contextlib.suppress(Exception):
+            await page.screenshot(path=str(screenshot_path), full_page=True)
+        with contextlib.suppress(Exception):
+            html_path.write_text(await page.content(), encoding="utf-8")
+        self.logger.error("match extraction artifacts saved screenshot=%s html=%s", screenshot_path, html_path, extra={"event": "match_extraction_artifacts"})
+
+    @staticmethod
+    def display_name(snapshot: MatchSnapshot) -> str:
+        return f"{snapshot.player_a} vs {snapshot.player_b}"
+
+    @staticmethod
+    def score_display(snapshot: MatchSnapshot) -> str:
+        return normalize_text(" ".join(part for part in [snapshot.set_score, snapshot.game_score, snapshot.point_score] if part)) or "N/A"
 
 
 class MonitoringEngine:
@@ -1296,9 +1463,42 @@ class MonitoringEngine:
         self.matches_scanned += len(snapshots)
         tasks = [self._process_snapshot(snapshot) for snapshot in snapshots]
         await asyncio.gather(*tasks)
-        ranked = sorted(self.states.values(), key=lambda state: state.opportunity_score, reverse=True)
+        current_states = [self.states[snapshot.match_id] for snapshot in snapshots if snapshot.match_id in self.states]
+        ranked = sorted(current_states, key=lambda state: state.opportunity_score, reverse=True)
         self.matches_qualified += len([state for state in ranked if state.opportunity_score >= 50])
-        self.logger.info("scan complete matches=%s top=%s", len(snapshots), [(s.match_id, round(s.opportunity_score, 2)) for s in ranked[:5]], extra={"event": "scan_complete"})
+        self._log_live_matches(snapshots)
+        self._log_top_opportunities(ranked[:10])
+        self._log_scan_complete(snapshots)
+
+    def _log_live_matches(self, snapshots: Sequence[MatchSnapshot]) -> None:
+        lines = ["LIVE MATCHES DETECTED"]
+        for index, snapshot in enumerate(snapshots, start=1):
+            lines.extend(
+                [
+                    "",
+                    f"[{index}] {MatchExtractor.display_name(snapshot)}",
+                    f"Tournament: {snapshot.tournament}",
+                    f"Score: {MatchExtractor.score_display(snapshot)}",
+                    f"Back Odds: {snapshot.back_odds_a:.2f}" if snapshot.back_odds_a else "Back Odds: N/A",
+                    f"Lay Odds: {snapshot.lay_odds_a:.2f}" if snapshot.lay_odds_a else "Lay Odds: N/A",
+                ]
+            )
+        self.logger.info("\n".join(lines), extra={"event": "live_matches_detected"})
+
+    def _log_top_opportunities(self, ranked_states: Sequence[MatchState]) -> None:
+        lines = ["TOP OPPORTUNITIES"]
+        for index, state in enumerate(ranked_states, start=1):
+            display_name = f"{state.player_a} vs {state.player_b}".strip()
+            if display_name == "vs":
+                continue
+            lines.extend(["", f"{index}. {display_name:<40} Score={round(state.opportunity_score)}"])
+        self.logger.info("\n".join(lines), extra={"event": "top_opportunities"})
+
+    def _log_scan_complete(self, snapshots: Sequence[MatchSnapshot]) -> None:
+        lines = ["SCAN COMPLETE", "", f"Matches Found: {len(snapshots)}", "", "Matches:"]
+        for index, snapshot in enumerate(snapshots, start=1):
+            lines.append(f"{index}. {MatchExtractor.display_name(snapshot)}")
+        self.logger.info("\n".join(lines), extra={"event": "scan_complete"})
 
     async def _process_snapshot(self, snapshot: MatchSnapshot) -> None:
         state = self.states.get(snapshot.match_id)
@@ -1323,7 +1523,13 @@ class MonitoringEngine:
         await self.db.insert_odds(snapshot)
         await asyncio.gather(*(self.db.insert_strategy(snapshot.match_id, sig, state.opportunity_score) for sig in signals))
         await self.trading_engine.evaluate(state)
-        self.logger.info("match updated", extra={"event": "match_update", "match_id": snapshot.match_id})
+        self.logger.info(
+            "match updated %s score=%s opportunity=%.2f",
+            MatchExtractor.display_name(snapshot),
+            MatchExtractor.score_display(snapshot),
+            state.opportunity_score,
+            extra={"event": "match_update", "match_id": snapshot.match_id},
+        )
 
     async def _handle_recoverable(self, subsystem: str, exc: BaseException) -> None:
         self.logger.exception("recoverable subsystem failure %s", subsystem, extra={"event": "recovery", "match_id": subsystem})
